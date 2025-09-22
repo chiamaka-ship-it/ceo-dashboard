@@ -7,7 +7,9 @@ from datetime import datetime
 # ============================================================
 # Config
 # ============================================================
-SHEET_CSV_URL = "PUT_YOUR_CSV_LINK_HERE"  # <-- keep your CSV link here
+# Your published Google Sheet CSV link (tested pattern)
+SHEET_CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vQ5-VF0xH9XbunX7DWFgtVlN_OUC9zwhYjD0ycs3anPgPgcnzYq3gcKLIMY_YonEzkDq44hbCLKgc8K/pub?gid=0&single=true&output=csv"
+
 st.set_page_config(page_title="CEO Marketing Dashboard", layout="wide")
 
 # --- subtle styling for a more polished look ---
@@ -26,7 +28,25 @@ hr {border: none; border-top: 1px solid rgba(255,255,255,0.1); margin: 1rem 0 1.
 # ============================================================
 @st.cache_data(ttl=600)
 def load_data(url=SHEET_CSV_URL):
-    df = pd.read_csv(url)
+    # Validate link first
+    if not isinstance(url, str) or not url.strip().lower().startswith(("http://", "https://")):
+        st.error("SHEET_CSV_URL is not a valid http(s) link. "
+                 "Open app.py and set SHEET_CSV_URL to your Google Sheet CSV URL.")
+        st.stop()
+
+    # Read CSV (will show a friendly error if it fails)
+    try:
+        df = pd.read_csv(url)
+    except Exception as e:
+        st.error(
+            "Couldn't read CSV from the provided URL.\n\n"
+            "Quick checks:\n"
+            "• Open the URL in a new tab — it should download or show plain CSV.\n"
+            "• If it asks for permission, publish the sheet to the web (CSV) or set 'Anyone with the link: Viewer'.\n"
+            "• Make sure the URL ends with `...export?format=csv` or `...output=csv`.\n\n"
+            f"Original error: {e}"
+        )
+        st.stop()
 
     # normalize column names -> snake_case
     df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
@@ -39,7 +59,7 @@ def load_data(url=SHEET_CSV_URL):
     # numeric cleanup: handle "3:1" -> 3, remove commas and 'x'
     if "numerical_value" in df.columns:
         nv = df["numerical_value"].astype(str).str.strip()
-        nv = nv.str.replace(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*:\s*[0-9]+.*$", r"\1", regex=True)
+        nv = nv.str.replace(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*:\s*[0-9]+.*$", r"\1", regex=True)  # 3:1 -> 3
         nv = nv.str.replace(",", "", regex=False).str.replace("x", "", case=False, regex=False)
         df["numerical_value"] = pd.to_numeric(nv, errors="coerce")
 
@@ -50,18 +70,20 @@ def load_data(url=SHEET_CSV_URL):
 
     # drop bad rows
     bad = {"", "nan", "none"}
-    df = df.dropna(subset=["numerical_value", "week_end"])
-    if "section" in df and "metric" in df:
+    if "section" in df.columns and "metric" in df.columns:
         df = df[
             (~df["section"].str.lower().isin(bad)) &
             (~df["metric"].str.lower().isin(bad))
         ]
+
+    df = df.dropna(subset=["numerical_value", "week_end"])
 
     # keep latest if duplicate (section, metric, week_end)
     df = df.sort_values("week_end").drop_duplicates(
         subset=["section", "metric", "week_end"], keep="last"
     )
     return df
+
 
 def prepare_timeseries(df, section, metric):
     ts = df[(df.section == section) & (df.metric == metric)].copy()
@@ -106,184 +128,4 @@ def compute_delta(series, mode="WoW"):
         pct = (delta / abs(prev_avg)) * 100
         return delta, pct, cur_avg
     else:
-        if len(s) < 2:
-            return None, None, cur
-        prev = s.iloc[-2]
-        if pd.isna(prev) or prev == 0:
-            return None, None, cur
-        delta = cur - prev
-        pct = (delta / abs(prev)) * 100
-        return delta, pct, cur
-
-def delta_color_mode(metric):
-    return "inverse" if not higher_is_better(metric) else "normal"
-
-def sparkline(ts):
-    return (
-        alt.Chart(ts)
-        .mark_line()
-        .encode(
-            x=alt.X("week_end:T", title=None),
-            y=alt.Y("numerical_value:Q", title=None)
-        )
-        .properties(height=60)
-    )
-
-def latest_vs_previous_df(df_section):
-    """
-    For each metric in a section, return a row with latest and previous values.
-    Rows missing a previous value are dropped for the bar chart.
-    """
-    out = []
-    for m in sorted(df_section["metric"].unique()):
-        ts = df_section[df_section["metric"] == m].sort_values("week_end")
-        if len(ts) >= 2:
-            latest = ts["numerical_value"].iloc[-1]
-            prev = ts["numerical_value"].iloc[-2]
-            out.append({"metric": m, "latest": latest, "previous": prev})
-    return pd.DataFrame(out)
-
-# ============================================================
-# Drawing
-# ============================================================
-def draw_metric_card(metric, ts, mode):
-    delta, pct, cur = compute_delta(ts["numerical_value"], mode=mode)
-    value_str = format_value(metric, cur if cur is not None else np.nan)
-    delta_str = "—" if (pct is None or pd.isna(pct)) else f"{pct:+.1f}%"
-
-    with st.container():
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.metric(metric, value_str, delta_str, delta_color=delta_color_mode(metric))
-        if len(ts) >= 8:
-            st.altair_chart(sparkline(ts), use_container_width=True)
-        st.markdown('</div>', unsafe_allow_html=True)
-
-def draw_section(df, section, mode, show_tables=False, show_latest_prev=True, show_timeline=True):
-    df_s = df[df.section == section]
-    if df_s.empty:
-        return
-
-    st.markdown('<div class="section-wrap">', unsafe_allow_html=True)
-    st.subheader(section)
-
-    # KPI cards grid (auto-wrap, 4 per row)
-    metrics = sorted(df_s.metric.unique())
-    cols = st.columns(4)
-    for i, m in enumerate(metrics):
-        with cols[i % 4]:
-            ts = prepare_timeseries(df_s, section, m)
-            draw_metric_card(m, ts, mode)
-
-    # --- Latest vs Previous (side-by-side bars) ---
-    if show_latest_prev:
-        comp = latest_vs_previous_df(df_s)
-        if not comp.empty:
-            # melt for grouped bars
-            melted = comp.melt(id_vars="metric", var_name="period", value_name="value")
-            chart = (
-                alt.Chart(melted)
-                .mark_bar()
-                .encode(
-                    x=alt.X("metric:N", title=None, sort=comp["metric"].tolist()),
-                    y=alt.Y("value:Q", title="Value"),
-                    color=alt.Color("period:N", title=""),
-                    column=alt.Column("period:N", title=None)  # two columns: previous | latest
-                )
-            )
-            st.markdown("**Latest vs previous**")
-            st.altair_chart(chart, use_container_width=True)
-
-    # --- Section timeline (overlay of top 3 volatile metrics) ---
-    if show_timeline:
-        pivot = df_s.pivot_table(index="week_end", columns="metric", values="numerical_value", aggfunc="mean")
-        if pivot.shape[1] >= 2 and pivot.shape[0] >= 2:
-            topn = min(3, pivot.shape[1])
-            top = pivot.std().sort_values(ascending=False).head(topn).index
-            melted = pivot[top].reset_index().melt("week_end", var_name="metric", value_name="value")
-            line = (
-                alt.Chart(melted)
-                .mark_line(point=False)
-                .encode(
-                    x=alt.X("week_end:T", title=None),
-                    y=alt.Y("value:Q", title=None),
-                    color=alt.Color("metric:N", title=None)
-                )
-                .properties(height=220)
-            )
-            st.markdown("**Section timeline (top movers)**")
-            st.altair_chart(line, use_container_width=True)
-
-    # --- Optional detail table for the section (ALL columns) ---
-    if show_tables:
-        tbl = df_s.copy().sort_values(["metric", "week_end"])
-        for dcol in ["week_start","week_end"]:
-            if dcol in tbl.columns:
-                tbl[dcol] = pd.to_datetime(tbl[dcol], errors="coerce").dt.date
-        st.markdown("**Details**")
-        st.dataframe(
-            tbl[["section","metric","numerical_value","source","notes","week_start","week_end"]],
-            use_container_width=True, hide_index=True
-        )
-
-    st.markdown("</div>", unsafe_allow_html=True)
-    st.markdown("<hr/>", unsafe_allow_html=True)
-
-# ============================================================
-# Main
-# ============================================================
-def main():
-    df = load_data()
-    if df.empty:
-        st.error("No data loaded. Check the CSV link and columns.")
-        return
-
-    min_date, max_date = df.week_end.min(), df.week_end.max()
-
-    st.title("📊 CEO Marketing Dashboard")
-    st.caption(f"Last updated: {max_date.strftime('%Y-%m-%d') if pd.notna(max_date) else '—'}")
-    st.markdown("**Legend:** Green delta = improvement, Red delta = decline. WoW uses latest vs previous week; MoM uses last 4-week average vs prior 4-week average.")
-
-    # Sidebar controls
-    st.sidebar.header("Controls")
-    date_range = st.sidebar.date_input("Date range", [min_date.date(), max_date.date()])
-    if isinstance(date_range, (tuple, list)) and len(date_range) == 2:
-        start, end = pd.to_datetime(date_range[0]), pd.to_datetime(date_range[1])
-    else:
-        start, end = min_date, max_date
-
-    secs = df["section"].astype(str).str.strip()
-    section_opts = sorted(s for s in secs.unique() if s and s.lower() not in ("nan","none"))
-    selected_sections = st.sidebar.multiselect("Sections", section_opts, default=section_opts)
-
-    mode = st.sidebar.radio("Comparison mode", ["WoW", "MoM"], index=0)
-    show_latest_prev = st.sidebar.checkbox("Show latest vs previous chart", value=True)
-    show_timeline = st.sidebar.checkbox("Show section timeline", value=True)
-    show_tables = st.sidebar.checkbox("Show section detail table", value=False)
-    show_raw = st.sidebar.checkbox("Show raw data (filtered)", value=False)
-
-    # Filter by date range
-    mask = (df.week_end >= pd.to_datetime(start)) & (df.week_end <= pd.to_datetime(end))
-    df_filtered = df[mask]
-
-    # Render sections
-    for sec in selected_sections:
-        draw_section(
-            df_filtered, sec, mode,
-            show_tables=show_tables,
-            show_latest_prev=show_latest_prev,
-            show_timeline=show_timeline
-        )
-
-    # Raw table + download
-    if show_raw:
-        st.header("Raw data (filtered)")
-        raw_tbl = df_filtered.sort_values(["section","metric","week_end"]).copy()
-        for dcol in ["week_start","week_end"]:
-            if dcol in raw_tbl.columns:
-                raw_tbl[dcol] = pd.to_datetime(raw_tbl[dcol], errors="coerce").dt.date
-        st.dataframe(raw_tbl, use_container_width=True, hide_index=True)
-        csv = raw_tbl.to_csv(index=False).encode("utf-8")
-        st.download_button("Download filtered CSV", data=csv, file_name="dashboard_filtered.csv", mime="text/csv")
-
-if __name__ == "__main__":
-    main()
+        i
