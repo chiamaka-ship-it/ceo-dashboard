@@ -3,13 +3,26 @@ import pandas as pd
 import numpy as np
 import altair as alt
 from datetime import datetime
-import re
 
 # ============================================================
 # Config
 # ============================================================
 SHEET_CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vQ5-VF0xH9XbunX7DWFgtVlN_OUC9zwhYjD0ycs3anPgPgcnzYq3gcKLIMY_YonEzkDq44hbCLKgc8K/pub?gid=0&single=true&output=csv"
 st.set_page_config(page_title="CEO Marketing Dashboard", layout="wide")
+
+# --- light styling so it’s not bland ---
+st.markdown("""
+<style>
+/* tighten layout a bit */
+.block-container {padding-top: 1rem;}
+/* subtle section dividers */
+hr {border: none; border-top: 1px solid rgba(255,255,255,0.08); margin: 1.2rem 0;}
+/* nicer subheaders */
+h3 {margin-top: 0.6rem;}
+/* table font size */
+[data-testid="stDataFrame"] div[data-testid="stVerticalBlock"] {font-size: 0.95rem;}
+</style>
+""", unsafe_allow_html=True)
 
 # ============================================================
 # Data loading and prep
@@ -21,50 +34,42 @@ def load_data(url=SHEET_CSV_URL):
     # normalize column names
     df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
 
-    # make text columns safe strings (avoid NaN strings leaking into UI)
+    # make text columns safe strings
     for col in ["section", "metric", "source", "notes"]:
         if col in df.columns:
             df[col] = df[col].astype(str).str.strip()
 
-    # pre-clean numeric column: handle "3:1" style for ROAS to become 3
+    # numeric cleanup: handle "3:1" like ROAS -> 3, remove commas/x
     if "numerical_value" in df.columns:
-        # keep the original as string for parsing
-        nv_str = df["numerical_value"].astype(str).str.strip()
-
-        # if looks like "3:1" -> take the left side as number
-        nv_str = nv_str.str.replace(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*:\s*[0-9]+.*$", r"\1", regex=True)
-        # remove commas and trailing x/X
-        nv_str = nv_str.str.replace(",", "", regex=False).str.replace("x", "", case=False, regex=False)
-
-        df["numerical_value"] = pd.to_numeric(nv_str, errors="coerce")
+        nv = df["numerical_value"].astype(str).str.strip()
+        nv = nv.str.replace(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*:\s*[0-9]+.*$", r"\1", regex=True)
+        nv = nv.str.replace(",", "", regex=False).str.replace("x", "", case=False, regex=False)
+        df["numerical_value"] = pd.to_numeric(nv, errors="coerce")
 
     # parse dates
     for col in ["week_start", "week_end"]:
         if col in df.columns:
             df[col] = pd.to_datetime(df[col], errors="coerce")
 
-    # drop rows with bad/blank section/metric or missing essentials
-    bad_tokens = {"", "nan", "none"}
-    if "section" in df.columns and "metric" in df.columns:
-        df = df[
-            (~df["section"].str.lower().isin(bad_tokens)) &
-            (~df["metric"].str.lower().isin(bad_tokens))
-        ]
+    # drop bad rows
+    bad = {"", "nan", "none"}
     df = df.dropna(subset=["numerical_value", "week_end"])
+    if "section" in df and "metric" in df:
+        df = df[
+            (~df["section"].str.lower().isin(bad)) &
+            (~df["metric"].str.lower().isin(bad))
+        ]
 
-    # keep latest if duplicates on (section, metric, week_end)
+    # keep latest if duplicate (section, metric, week_end)
     df = df.sort_values("week_end").drop_duplicates(
         subset=["section", "metric", "week_end"], keep="last"
     )
-
     return df
-
 
 def prepare_timeseries(df, section, metric):
     ts = df[(df.section == section) & (df.metric == metric)].copy()
     ts = ts.sort_values("week_end")
     return ts[["week_end", "numerical_value"]]
-
 
 # ============================================================
 # Helpers
@@ -73,65 +78,37 @@ def format_value(metric, val):
     if pd.isna(val):
         return "—"
     name = metric.lower()
-
-    # currency-like
     if any(x in name for x in ["revenue", "aov", "gmv"]):
         return f"₦{val:,.0f}"
-
-    # percent-like
     if any(x in name for x in ["%", "rate", "index", "share of voice", "sov"]):
         return f"{val:.1f}%"
-
-    # roas ratio
     if "roas" in name:
         return f"{val:.1f}x"
-
-    # nps
     if "nps" in name or "promoter" in name:
-        return f"{int(val)} pts"
-
-    # integer-ish counts
-    if any(x in name for x in [
-        "orders", "customers", "pr hits", "active users", "views", "reach",
-        "interactions", "follows", "mentions"
-    ]):
+        return f"{int(round(val))} pts"
+    if any(x in name for x in ["orders","customers","pr hits","active users","views","reach","interactions","follows","mentions"]):
         return f"{int(round(val)):,}"
-
-    # default
     return f"{val:,.1f}"
-
 
 def higher_is_better(metric):
     name = metric.lower()
-    # lower is better for CAC and churn
-    if any(k in name for k in ["cac", "churn"]):
-        return False
-    return True
-
+    return not any(k in name for k in ["cac", "churn"])
 
 def compute_delta(series, mode="WoW"):
-    """
-    Returns (delta_value, pct_change, current_value)
-    pct_change is a float or None. Handles NaNs safely.
-    """
     s = pd.to_numeric(series, errors="coerce").dropna()
     if len(s) == 0:
         return None, None, None
-
     cur = s.iloc[-1]
-
     if mode == "MoM":
-        # need at least 8 points for 4w vs prior 4w
         if len(s) < 8:
             return None, None, cur
-        current_avg = s.iloc[-4:].mean()
-        prev_avg = s.iloc[-8:-4].mean()
+        cur_avg, prev_avg = s.iloc[-4:].mean(), s.iloc[-8:-4].mean()
         if pd.isna(prev_avg) or prev_avg == 0:
-            return None, None, cur
-        delta = current_avg - prev_avg
+            return None, None, cur_avg
+        delta = cur_avg - prev_avg
         pct = (delta / abs(prev_avg)) * 100
-        return delta, pct, current_avg
-    else:  # WoW
+        return delta, pct, cur_avg
+    else:
         if len(s) < 2:
             return None, None, cur
         prev = s.iloc[-2]
@@ -141,71 +118,62 @@ def compute_delta(series, mode="WoW"):
         pct = (delta / abs(prev)) * 100
         return delta, pct, cur
 
-
 def delta_color_mode(metric):
-    """
-    For metrics where lower is better, flip colors (Streamlit 'inverse').
-    """
     return "inverse" if not higher_is_better(metric) else "normal"
-
 
 # ============================================================
 # Drawing
 # ============================================================
-def draw_metric_card(section, metric, ts, mode):
+def draw_metric_card(metric, ts, mode):
     delta, pct, cur = compute_delta(ts["numerical_value"], mode=mode)
     value_str = format_value(metric, cur if cur is not None else np.nan)
-
     delta_str = "—" if (pct is None or pd.isna(pct)) else f"{pct:+.1f}%"
-    st.metric(
-        metric,
-        value_str,
-        delta_str,
-        delta_color=delta_color_mode(metric),
-    )
-
+    st.metric(metric, value_str, delta_str, delta_color=delta_color_mode(metric))
     if len(ts) >= 8:
         chart = (
             alt.Chart(ts)
             .mark_line()
-            .encode(
-                x=alt.X("week_end:T", title=""),
-                y=alt.Y("numerical_value:Q", title=""),
-            )
+            .encode(x=alt.X("week_end:T", title=""), y=alt.Y("numerical_value:Q", title=""))
             .properties(height=60)
         )
         st.altair_chart(chart, use_container_width=True)
 
+def section_table(df_section):
+    """Return a table that shows ALL columns for the filtered section."""
+    tbl = df_section.copy()
+    # Add a formatted value column but keep original numeric too
+    tbl["value_formatted"] = tbl.apply(
+        lambda r: format_value(r["metric"], r["numerical_value"]), axis=1
+    )
+    # order columns for readability
+    cols = ["section","metric","numerical_value","value_formatted","source","notes","week_start","week_end"]
+    cols = [c for c in cols if c in tbl.columns]
+    tbl = tbl[cols].sort_values(["metric","week_end"])
+    # nicer date display
+    for dcol in ["week_start","week_end"]:
+        if dcol in tbl.columns:
+            tbl[dcol] = pd.to_datetime(tbl[dcol], errors="coerce").dt.date
+    return tbl
 
-def draw_section(df, section, mode):
+def draw_section(df, section, mode, show_detail_tables=True):
     subset = df[df.section == section]
     if subset.empty:
-        st.info(f"No data for {section}")
         return
-
     st.subheader(section)
+
+    # KPI grid
     metrics = subset.metric.unique()
     cols = st.columns(4)
-    for i, metric in enumerate(metrics):
+    for i, m in enumerate(metrics):
         with cols[i % 4]:
-            ts = prepare_timeseries(df, section, metric)
-            draw_metric_card(section, metric, ts, mode)
+            ts = prepare_timeseries(subset, section, m)
+            draw_metric_card(m, ts, mode)
 
-    # Section-level combined trend of top 3 variable metrics (if enough)
-    pivot = subset.pivot_table(
-        index="week_end", columns="metric", values="numerical_value", aggfunc="mean"
-    )
-    if pivot.shape[1] >= 3 and pivot.shape[0] >= 2:
-        top3 = pivot.std().sort_values(ascending=False).head(3).index
-        melted = pivot[top3].reset_index().melt("week_end", var_name="metric", value_name="value")
-        chart = (
-            alt.Chart(melted)
-            .mark_line()
-            .encode(x="week_end:T", y="value:Q", color="metric:N")
-            .properties(height=200)
-        )
-        st.altair_chart(chart, use_container_width=True)
-
+    # Section detail table (ALL columns)
+    if show_detail_tables:
+        st.markdown("**Details**")
+        st.dataframe(section_table(subset), use_container_width=True, hide_index=True)
+    st.markdown("<hr/>", unsafe_allow_html=True)
 
 # ============================================================
 # Main
@@ -213,16 +181,15 @@ def draw_section(df, section, mode):
 def main():
     df = load_data()
     if df.empty:
-        st.error("No data loaded. Please check the SHEET_CSV_URL.")
+        st.error("No data loaded. Please check the CSV link and sheet structure.")
         return
 
     min_date, max_date = df.week_end.min(), df.week_end.max()
-
     st.title("📊 CEO Marketing Dashboard")
     st.caption(f"Last updated: {max_date.strftime('%Y-%m-%d') if pd.notna(max_date) else '—'}")
-    st.markdown("**Legend:** Green delta = improvement, Red delta = decline.")
+    st.markdown("**Legend:** Green delta = improvement, Red delta = decline. Use the date range to control which rows appear in cards and tables.")
 
-    # Controls
+    # Sidebar controls
     st.sidebar.header("Controls")
     date_range = st.sidebar.date_input("Date range", [min_date.date(), max_date.date()])
     if isinstance(date_range, (tuple, list)) and len(date_range) == 2:
@@ -230,22 +197,34 @@ def main():
     else:
         start, end = min_date, max_date
 
-    # Clean section options (remove '', 'nan', 'none')
-    section_series = df["section"].astype(str).str.strip()
-    section_opts = sorted(s for s in section_series.unique() if s and s.lower() not in ("nan", "none"))
+    # Clean section options
+    secs = df["section"].astype(str).str.strip()
+    section_opts = sorted(s for s in secs.unique() if s and s.lower() not in ("nan","none"))
     selected_sections = st.sidebar.multiselect("Sections", section_opts, default=section_opts)
 
-    mode = st.sidebar.radio("Comparison mode", ["WoW", "MoM"])
+    mode = st.sidebar.radio("Comparison mode", ["WoW", "MoM"], index=0, horizontal=False)
+    show_detail_tables = st.sidebar.checkbox("Show section detail tables", value=True)
+    show_raw = st.sidebar.checkbox("Show raw data (filtered)", value=False)
 
-    st.markdown(f"_Comparison mode = **{mode}**._")
-
-    # Filter
+    # Filter by date
     mask = (df.week_end >= pd.to_datetime(start)) & (df.week_end <= pd.to_datetime(end))
     df_filtered = df[mask]
 
-    for section in selected_sections:
-        draw_section(df_filtered, section, mode)
+    # Render sections
+    for sec in selected_sections:
+        draw_section(df_filtered, sec, mode, show_detail_tables=show_detail_tables)
 
+    # Raw data table + download
+    if show_raw:
+        st.header("Raw data (filtered)")
+        raw_tbl = df_filtered.copy().sort_values(["section","metric","week_end"])
+        for dcol in ["week_start","week_end"]:
+            if dcol in raw_tbl.columns:
+                raw_tbl[dcol] = pd.to_datetime(raw_tbl[dcol], errors="coerce").dt.date
+        st.dataframe(raw_tbl, use_container_width=True, hide_index=True)
+
+        csv = raw_tbl.to_csv(index=False).encode("utf-8")
+        st.download_button("Download filtered CSV", data=csv, file_name="dashboard_filtered.csv", mime="text/csv")
 
 if __name__ == "__main__":
     main()
